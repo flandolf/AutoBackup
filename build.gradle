@@ -20,7 +20,7 @@ repositories {
 }
 
 dependencies {
-    compileOnly("io.papermc.paper:paper-api:26.2.build.25-alpha")
+    compileOnly("io.papermc.paper:paper-api:26.1.2.build.72-stable")
     implementation("commons-net:commons-net:3.9.0")
     implementation('com.dropbox.core:dropbox-core-sdk:7.0.0') {
         exclude group: 'com.fasterxml.jackson.core', module: 'jackson-core'
