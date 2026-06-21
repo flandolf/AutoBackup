@@ -1,62 +1,101 @@
 package tr.alperendemir.autoBackup;
 
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.scheduler.BukkitTask;
 
-import java.io.*;
-import java.nio.file.*;
-import java.util.*;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
-import java.text.SimpleDateFormat;
 
 public final class AutoBackup extends JavaPlugin {
 
-    private int backupFrequency; // Frequency in seconds
-    private int maxBackups; // Maximum backups to retain
-    private String backupPath; // Backup folder path
-    private List<String> worlds; // List of worlds to backup
+    private static final DateTimeFormatter BACKUP_TIMESTAMP = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss");
+    private static final long SHUTDOWN_TIMEOUT_SECONDS = 10L;
 
-    // FTP Configuration
+    private final AtomicBoolean backupRunning = new AtomicBoolean();
+    private final AtomicBoolean stopping = new AtomicBoolean();
+
+    private int backupFrequency;
+    private int maxBackups;
+    private Path backupPath;
+    private List<String> worlds;
+    private Logger logger;
+
     private boolean ftpEnabled;
     private FTPUploader ftpUploader;
 
-    // Dropbox Configuration
     private boolean dropboxEnabled;
     private DropboxUploader dropboxUploader;
 
+    private ExecutorService backupExecutor;
+    private BukkitTask backupTriggerTask;
+
     @Override
     public void onEnable() {
-        // Load the configuration
+        logger = getLogger();
+        stopping.set(false);
+        backupRunning.set(false);
+
         saveDefaultConfig();
         loadConfigValues();
 
-        // Create backup directory if it doesn't exist
-        File backupDir = new File(backupPath);
-        if (!backupDir.exists()) {
-            backupDir.mkdirs();
-            getLogger().info("Backup directory created at: " + backupDir.getAbsolutePath());
+        try {
+            Files.createDirectories(backupPath);
+        } catch (IOException e) {
+            logger.log(Level.SEVERE, "Unable to create backup directory: " + backupPath.toAbsolutePath(), e);
+            getServer().getPluginManager().disablePlugin(this);
+            return;
         }
 
-        // Start the periodic backup task
         startBackupTask();
-
-        getLogger().info("AutoBackup plugin enabled! Backing up every " + backupFrequency + " seconds.");
+        logger.info("AutoBackup enabled; backing up every " + backupFrequency + " seconds.");
     }
 
     @Override
     public void onDisable() {
-        getLogger().info("AutoBackup plugin disabled!");
+        stopBackupTask();
+        if (logger != null) {
+            logger.info("AutoBackup disabled.");
+        }
     }
 
     private void loadConfigValues() {
         backupFrequency = getConfig().getInt("backup-frequency", 3600);
-        maxBackups = getConfig().getInt("max-backups", 5);
-        backupPath = getConfig().getString("backup-path", "backups");
-        worlds = getConfig().getStringList("worlds");
+        if (backupFrequency <= 0) {
+            logger.warning("backup-frequency must be greater than zero; using 3600 seconds.");
+            backupFrequency = 3600;
+        }
 
-        // FTP Configuration
+        maxBackups = getConfig().getInt("max-backups", 5);
+        if (maxBackups < 0) {
+            logger.warning("max-backups cannot be negative; using 5.");
+            maxBackups = 5;
+        }
+
+        backupPath = Paths.get(getConfig().getString("backup-path", "backups"));
+        worlds = List.copyOf(getConfig().getStringList("worlds"));
+
         ftpEnabled = getConfig().getBoolean("ftp.enabled", false);
         if (ftpEnabled) {
             ftpUploader = new FTPUploader(
@@ -66,102 +105,183 @@ public final class AutoBackup extends JavaPlugin {
                     getConfig().getString("ftp.password", ""),
                     getConfig().getString("ftp.remote-path", "/backups"),
                     getConfig().getBoolean("ftp.use-implicit-tls", true),
-                    getLogger()
+                    logger
             );
         }
 
-        // Dropbox Configuration
         dropboxEnabled = getConfig().getBoolean("dropbox.enabled", false);
         if (dropboxEnabled) {
             dropboxUploader = new DropboxUploader(
                     getConfig().getString("dropbox.access-token", ""),
                     getConfig().getString("dropbox.remote-path", "/backups"),
-                    getLogger()
+                    logger
             );
         }
     }
 
     private void startBackupTask() {
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                performBackup();
+        backupExecutor = Executors.newSingleThreadExecutor(runnable -> {
+            Thread thread = new Thread(runnable, getName() + "-backup-worker");
+            thread.setDaemon(true);
+            return thread;
+        });
+
+        long periodTicks = Math.multiplyExact((long) backupFrequency, 20L);
+        backupTriggerTask = getServer().getScheduler().runTaskTimer(this, this::queueBackup, 1L, periodTicks);
+    }
+
+    private void queueBackup() {
+        if (stopping.get() || !backupRunning.compareAndSet(false, true)) {
+            return;
+        }
+
+        try {
+            backupExecutor.execute(() -> {
+                try {
+                    performBackup();
+                } catch (CancellationException ignored) {
+                    // Expected when the plugin is disabled during a backup.
+                } catch (RuntimeException e) {
+                    if (!stopping.get()) {
+                        logger.log(Level.SEVERE, "Unexpected backup failure", e);
+                    }
+                } finally {
+                    backupRunning.set(false);
+                }
+            });
+        } catch (RejectedExecutionException ignored) {
+            backupRunning.set(false);
+        }
+    }
+
+    private void stopBackupTask() {
+        stopping.set(true);
+
+        if (backupTriggerTask != null) {
+            backupTriggerTask.cancel();
+            backupTriggerTask = null;
+        }
+        if (ftpUploader != null) {
+            ftpUploader.cancel();
+        }
+        if (dropboxUploader != null) {
+            dropboxUploader.cancel();
+        }
+
+        ExecutorService executor = backupExecutor;
+        backupExecutor = null;
+        if (executor == null) {
+            return;
+        }
+
+        executor.shutdownNow();
+        try {
+            if (!executor.awaitTermination(SHUTDOWN_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                logger.warning("Backup worker did not stop within " + SHUTDOWN_TIMEOUT_SECONDS
+                        + " seconds; it will not block server shutdown.");
             }
-        }.runTaskTimerAsynchronously(this, 0L, backupFrequency * 20L); // Convert seconds to ticks
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            logger.warning("Interrupted while waiting for the backup worker to stop.");
+        }
     }
 
     private void performBackup() {
-        getLogger().info("Starting backup process...");
+        checkCancellation();
+        logger.info("Starting backup process...");
 
         List<String> backupFiles = new ArrayList<>();
+        String timestamp = BACKUP_TIMESTAMP.format(LocalDateTime.now());
 
         for (String worldName : worlds) {
-            File worldDir = new File(worldName);
-            if (worldDir.exists() && worldDir.isDirectory()) {
-                String backupFileName = backupPath + "/" + worldName + "_" +
-                        new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss").format(new Date()) + ".zip";
-                try {
-                    zipDirectory(worldDir.toPath(), Paths.get(backupFileName));
-                    backupFiles.add(backupFileName);
-                    getLogger().info("Backed up world: " + worldName + " to " + backupFileName);
-                } catch (IOException e) {
-                    getLogger().severe("Failed to backup world: " + worldName + " - " + e.getMessage());
+            checkCancellation();
+            Path worldDirectory = Paths.get(worldName);
+            if (!Files.isDirectory(worldDirectory)) {
+                logger.warning("World directory not found: " + worldName);
+                continue;
+            }
+
+            Path backupFile = backupPath.resolve(worldName + "_" + timestamp + ".zip");
+            try {
+                zipDirectory(worldDirectory, backupFile);
+                backupFiles.add(backupFile.toString());
+                logger.info("Backed up world: " + worldName + " to " + backupFile);
+            } catch (IOException e) {
+                if (!stopping.get()) {
+                    logger.log(Level.SEVERE, "Failed to backup world: " + worldName, e);
                 }
-            } else {
-                getLogger().warning("World directory not found: " + worldName);
             }
         }
 
-        // Upload to FTP if enabled
+        checkCancellation();
         if (ftpEnabled && ftpUploader != null) {
             ftpUploader.uploadBackups(backupFiles);
         }
 
-        // Upload to Dropbox if enabled
+        checkCancellation();
         if (dropboxEnabled && dropboxUploader != null) {
             dropboxUploader.uploadBackups(backupFiles);
         }
 
+        checkCancellation();
         cleanupOldBackups();
-        getLogger().info("Backup process completed.");
+        logger.info("Backup process completed.");
     }
 
     private void cleanupOldBackups() {
-        File backupDir = new File(backupPath);
-        if (!backupDir.exists() || !backupDir.isDirectory()) return;
+        java.io.File[] backups = backupPath.toFile().listFiles((dir, name) -> name.endsWith(".zip"));
+        if (backups == null) {
+            return;
+        }
 
-        File[] backups = backupDir.listFiles((dir, name) -> name.endsWith(".zip"));
-        if (backups == null) return;
-
-        // Sort backups by last modified time
-        Arrays.sort(backups, Comparator.comparingLong(File::lastModified));
-
-        // Delete old backups if they exceed maxBackups
+        Arrays.sort(backups, Comparator.comparingLong(java.io.File::lastModified));
         int backupsToDelete = backups.length - maxBackups;
         for (int i = 0; i < backupsToDelete; i++) {
-            if (backups[i].delete()) {
-                getLogger().info("Deleted old backup: " + backups[i].getName());
-            } else {
-                getLogger().warning("Failed to delete old backup: " + backups[i].getName());
+            checkCancellation();
+            try {
+                Files.deleteIfExists(backups[i].toPath());
+                logger.info("Deleted old backup: " + backups[i].getName());
+            } catch (IOException e) {
+                logger.log(Level.WARNING, "Failed to delete old backup: " + backups[i].getName(), e);
             }
         }
     }
 
-    private void zipDirectory(Path sourceDir, Path zipFilePath) throws IOException {
-        try (ZipOutputStream zipOutputStream = new ZipOutputStream(new FileOutputStream(zipFilePath.toFile()));
-             Stream<Path> paths = Files.walk(sourceDir)) {
-            paths.filter(path -> !Files.isDirectory(path)) // Skip directories
-                    .filter(path -> !path.getFileName().toString().equals("session.lock")) // Skip session.lock file
-                    .forEach(path -> {
-                        ZipEntry zipEntry = new ZipEntry(sourceDir.relativize(path).toString());
-                        try {
-                            zipOutputStream.putNextEntry(zipEntry);
-                            Files.copy(path, zipOutputStream);
-                            zipOutputStream.closeEntry();
-                        } catch (IOException e) {
-                            getLogger().severe("Error while zipping file: " + path + " - " + e.getMessage());
-                        }
-                    });
+    private void zipDirectory(Path sourceDirectory, Path zipFile) throws IOException {
+        Files.createDirectories(zipFile.toAbsolutePath().getParent());
+
+        try (OutputStream output = Files.newOutputStream(
+                zipFile,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.TRUNCATE_EXISTING
+        ); ZipOutputStream zipOutput = new ZipOutputStream(output);
+             Stream<Path> paths = Files.walk(sourceDirectory)) {
+            Iterator<Path> iterator = paths
+                    .filter(Files::isRegularFile)
+                    .filter(path -> !path.getFileName().toString().equals("session.lock"))
+                    .iterator();
+
+            while (iterator.hasNext()) {
+                checkCancellation();
+                Path path = iterator.next();
+                String entryName = sourceDirectory.relativize(path).toString().replace('\\', '/');
+                zipOutput.putNextEntry(new ZipEntry(entryName));
+                Files.copy(path, zipOutput);
+                zipOutput.closeEntry();
+            }
+        } catch (CancellationException | IOException e) {
+            try {
+                Files.deleteIfExists(zipFile);
+            } catch (IOException cleanupError) {
+                e.addSuppressed(cleanupError);
+            }
+            throw e;
+        }
+    }
+
+    private void checkCancellation() {
+        if (stopping.get() || Thread.currentThread().isInterrupted()) {
+            throw new CancellationException("Backup cancelled during plugin shutdown");
         }
     }
 }

@@ -1,14 +1,16 @@
 package tr.alperendemir.autoBackup;
 
-import org.apache.commons.net.PrintCommandListener;
 import org.apache.commons.net.ftp.FTPReply;
 import org.apache.commons.net.ftp.FTPSClient;
 
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
-import java.io.PrintWriter;
+import java.io.InterruptedIOException;
+import java.time.Duration;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
 public class FTPUploader {
@@ -19,6 +21,8 @@ public class FTPUploader {
     private final String remotePath;
     private final boolean useImplicitTLS;
     private final Logger logger;
+    private final AtomicBoolean cancelled = new AtomicBoolean();
+    private final AtomicReference<FTPSClient> activeClient = new AtomicReference<>();
 
     public FTPUploader(String host, int port, String username, String password,
                        String remotePath, boolean useImplicitTLS, Logger logger) {
@@ -32,31 +36,42 @@ public class FTPUploader {
     }
 
     public boolean uploadBackups(List<String> backupFiles) {
+        if (isCancelled()) {
+            return false;
+        }
         if (backupFiles == null || backupFiles.isEmpty()) {
             logger.info("No backup files to upload.");
             return true;
         }
 
         FTPSClient ftpsClient = new FTPSClient(useImplicitTLS);
+        activeClient.set(ftpsClient);
         boolean allUploadsSuccessful = true;
 
         try {
-            ftpsClient.setConnectTimeout(30000); // Increase connection timeout to 30s
-            ftpsClient.setBufferSize(1024 * 1024); // Set socket buffer size to 1MB
-            ftpsClient.addProtocolCommandListener(new PrintCommandListener(new PrintWriter(System.out), true));
+            ftpsClient.setConnectTimeout(30000);
+            ftpsClient.setDataTimeout(Duration.ofSeconds(30));
+            ftpsClient.setBufferSize(1024 * 1024);
 
+            checkCancellation();
             connectToServer(ftpsClient);
+            ftpsClient.setSoTimeout(30000);
+            checkCancellation();
             prepareRemoteDirectory(ftpsClient);
 
             for (String backupFile : backupFiles) {
+                checkCancellation();
                 if (!uploadSingleFile(ftpsClient, backupFile)) {
                     allUploadsSuccessful = false;
                 }
             }
         } catch (IOException e) {
-            logger.severe("FTP upload error: " + e.getMessage());
+            if (!isCancelled()) {
+                logger.severe("FTP upload error: " + e.getMessage());
+            }
             allUploadsSuccessful = false;
         } finally {
+            activeClient.compareAndSet(ftpsClient, null);
             disconnectFromServer(ftpsClient);
         }
 
@@ -87,6 +102,7 @@ public class FTPUploader {
         String remoteFileName = localFile.getName();
 
         try (FileInputStream fis = new FileInputStream(localFile)) {
+            checkCancellation();
             logger.info("Uploading file: " + localFilePath);
             if (ftpsClient.storeFile(remoteFileName, fis)) {
                 logger.info("Uploaded file successfully: " + remoteFileName);
@@ -97,15 +113,21 @@ public class FTPUploader {
                 // Switch to active mode dynamically if passive mode fails
                 logger.info("Switching to active mode...");
                 ftpsClient.enterLocalActiveMode();
-                if (ftpsClient.storeFile(remoteFileName, fis)) {
-                    logger.info("Uploaded file successfully in active mode: " + remoteFileName);
-                    return true;
-                } else {
+                try (FileInputStream retryInput = new FileInputStream(localFile)) {
+                    checkCancellation();
+                    if (ftpsClient.storeFile(remoteFileName, retryInput)) {
+                        logger.info("Uploaded file successfully in active mode: " + remoteFileName);
+                        return true;
+                    }
+                }
+                if (!isCancelled()) {
                     logger.severe("Active mode also failed for file: " + remoteFileName);
                 }
             }
         } catch (IOException e) {
-            logger.severe("Error uploading file: " + e.getMessage());
+            if (!isCancelled()) {
+                logger.severe("Error uploading file: " + e.getMessage());
+            }
             return false;
         }
         return false;
@@ -126,12 +148,40 @@ public class FTPUploader {
     private void disconnectFromServer(FTPSClient ftpsClient) {
         try {
             if (ftpsClient.isConnected()) {
-                ftpsClient.logout();
+                if (!cancelled.get()) {
+                    ftpsClient.logout();
+                }
                 ftpsClient.disconnect();
-                logger.info("Disconnected from FTP server.");
+                if (!cancelled.get()) {
+                    logger.info("Disconnected from FTP server.");
+                }
             }
         } catch (IOException e) {
-            logger.severe("Error closing FTP connection: " + e.getMessage());
+            if (!cancelled.get()) {
+                logger.severe("Error closing FTP connection: " + e.getMessage());
+            }
+        }
+    }
+
+    public void cancel() {
+        cancelled.set(true);
+        FTPSClient ftpsClient = activeClient.getAndSet(null);
+        if (ftpsClient != null && ftpsClient.isConnected()) {
+            try {
+                ftpsClient.disconnect();
+            } catch (IOException ignored) {
+                // Closing the socket is only used to unblock shutdown.
+            }
+        }
+    }
+
+    private boolean isCancelled() {
+        return cancelled.get() || Thread.currentThread().isInterrupted();
+    }
+
+    private void checkCancellation() throws InterruptedIOException {
+        if (isCancelled()) {
+            throw new InterruptedIOException("FTP upload cancelled during plugin shutdown");
         }
     }
 }
