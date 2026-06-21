@@ -9,16 +9,15 @@ import com.dropbox.core.v2.files.WriteMode;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
-public class DropboxUploader {
+final class DropboxUploader {
     private final DbxClientV2 client;
     private final Logger logger;
     private final String remotePath;
-    private final AtomicBoolean cancelled = new AtomicBoolean();
+    private volatile boolean cancelled;
 
-    public DropboxUploader(String accessToken, String remotePath, Logger logger) {
+    DropboxUploader(String accessToken, String remotePath, Logger logger) {
         StandardHttpRequestor.Config httpConfig = StandardHttpRequestor.Config.builder()
                 .withConnectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
                 .withReadTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
@@ -31,15 +30,14 @@ public class DropboxUploader {
         this.remotePath = remotePath;
     }
 
-    public boolean uploadBackups(List<String> backupFiles) {
+    void uploadBackups(List<String> backupFiles) {
         if (isCancelled()) {
-            return false;
+            return;
         }
-        boolean allUploadsSuccessful = true;
 
         for (String localFilePath : backupFiles) {
             if (isCancelled()) {
-                return false;
+                return;
             }
             String dropboxFilePath = remotePath + "/" + new java.io.File(localFilePath).getName();
             try (InputStream in = new FileInputStream(localFilePath)) {
@@ -54,18 +52,15 @@ public class DropboxUploader {
                 if (!isCancelled()) {
                     logger.severe("Error uploading to Dropbox: " + localFilePath + " - " + e.getMessage());
                 }
-                allUploadsSuccessful = false;
             }
         }
-
-        return allUploadsSuccessful;
     }
 
-    public void cancel() {
-        cancelled.set(true);
+    void cancel() {
+        cancelled = true;
     }
 
     private boolean isCancelled() {
-        return cancelled.get() || Thread.currentThread().isInterrupted();
+        return cancelled || Thread.currentThread().isInterrupted();
     }
 }

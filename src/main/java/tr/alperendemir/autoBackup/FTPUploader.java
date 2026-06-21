@@ -9,11 +9,10 @@ import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.time.Duration;
 import java.util.List;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Logger;
 
-public class FTPUploader {
+final class FTPUploader {
     private final String host;
     private final int port;
     private final String username;
@@ -21,11 +20,11 @@ public class FTPUploader {
     private final String remotePath;
     private final boolean useImplicitTLS;
     private final Logger logger;
-    private final AtomicBoolean cancelled = new AtomicBoolean();
+    private volatile boolean cancelled;
     private final AtomicReference<FTPSClient> activeClient = new AtomicReference<>();
 
-    public FTPUploader(String host, int port, String username, String password,
-                       String remotePath, boolean useImplicitTLS, Logger logger) {
+    FTPUploader(String host, int port, String username, String password,
+                String remotePath, boolean useImplicitTLS, Logger logger) {
         this.host = host;
         this.port = port;
         this.username = username;
@@ -35,18 +34,17 @@ public class FTPUploader {
         this.logger = logger;
     }
 
-    public boolean uploadBackups(List<String> backupFiles) {
+    void uploadBackups(List<String> backupFiles) {
         if (isCancelled()) {
-            return false;
+            return;
         }
-        if (backupFiles == null || backupFiles.isEmpty()) {
+        if (backupFiles.isEmpty()) {
             logger.info("No backup files to upload.");
-            return true;
+            return;
         }
 
         FTPSClient ftpsClient = new FTPSClient(useImplicitTLS);
         activeClient.set(ftpsClient);
-        boolean allUploadsSuccessful = true;
 
         try {
             ftpsClient.setConnectTimeout(30000);
@@ -61,21 +59,17 @@ public class FTPUploader {
 
             for (String backupFile : backupFiles) {
                 checkCancellation();
-                if (!uploadSingleFile(ftpsClient, backupFile)) {
-                    allUploadsSuccessful = false;
-                }
+                uploadSingleFile(ftpsClient, backupFile);
             }
         } catch (IOException e) {
             if (!isCancelled()) {
                 logger.severe("FTP upload error: " + e.getMessage());
             }
-            allUploadsSuccessful = false;
         } finally {
             activeClient.compareAndSet(ftpsClient, null);
             disconnectFromServer(ftpsClient);
         }
 
-        return allUploadsSuccessful;
     }
 
     private void connectToServer(FTPSClient ftpsClient) throws IOException {
@@ -97,7 +91,7 @@ public class FTPUploader {
         logger.info("Connected to FTP server with implicit TLS: " + useImplicitTLS);
     }
 
-    private boolean uploadSingleFile(FTPSClient ftpsClient, String localFilePath) {
+    private void uploadSingleFile(FTPSClient ftpsClient, String localFilePath) {
         File localFile = new File(localFilePath);
         String remoteFileName = localFile.getName();
 
@@ -106,7 +100,7 @@ public class FTPUploader {
             logger.info("Uploading file: " + localFilePath);
             if (ftpsClient.storeFile(remoteFileName, fis)) {
                 logger.info("Uploaded file successfully: " + remoteFileName);
-                return true;
+                return;
             } else {
                 logger.severe("Failed to upload file: " + remoteFileName);
 
@@ -117,7 +111,7 @@ public class FTPUploader {
                     checkCancellation();
                     if (ftpsClient.storeFile(remoteFileName, retryInput)) {
                         logger.info("Uploaded file successfully in active mode: " + remoteFileName);
-                        return true;
+                        return;
                     }
                 }
                 if (!isCancelled()) {
@@ -128,9 +122,7 @@ public class FTPUploader {
             if (!isCancelled()) {
                 logger.severe("Error uploading file: " + e.getMessage());
             }
-            return false;
         }
-        return false;
     }
 
 
@@ -148,23 +140,23 @@ public class FTPUploader {
     private void disconnectFromServer(FTPSClient ftpsClient) {
         try {
             if (ftpsClient.isConnected()) {
-                if (!cancelled.get()) {
+                if (!cancelled) {
                     ftpsClient.logout();
                 }
                 ftpsClient.disconnect();
-                if (!cancelled.get()) {
+                if (!cancelled) {
                     logger.info("Disconnected from FTP server.");
                 }
             }
         } catch (IOException e) {
-            if (!cancelled.get()) {
+            if (!cancelled) {
                 logger.severe("Error closing FTP connection: " + e.getMessage());
             }
         }
     }
 
-    public void cancel() {
-        cancelled.set(true);
+    void cancel() {
+        cancelled = true;
         FTPSClient ftpsClient = activeClient.getAndSet(null);
         if (ftpsClient != null && ftpsClient.isConnected()) {
             try {
@@ -176,7 +168,7 @@ public class FTPUploader {
     }
 
     private boolean isCancelled() {
-        return cancelled.get() || Thread.currentThread().isInterrupted();
+        return cancelled || Thread.currentThread().isInterrupted();
     }
 
     private void checkCancellation() throws InterruptedIOException {

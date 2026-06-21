@@ -5,7 +5,7 @@ plugins {
 
 shadowJar {
     relocate 'org.apache.commons.net', 'your.plugin.shaded.org.apache.commons.net'
-    archiveClassifier.set("") // Remove the "-all" suffix
+    archiveClassifier.set("")
 }
 
 group = 'tr.alperendemir'
@@ -29,22 +29,14 @@ dependencies {
     }
 }
 
-def targetJavaVersion = 25
 java {
-    def javaVersion = JavaVersion.toVersion(targetJavaVersion)
-    sourceCompatibility = javaVersion
-    targetCompatibility = javaVersion
-    if (JavaVersion.current() < javaVersion) {
-        toolchain.languageVersion = JavaLanguageVersion.of(targetJavaVersion)
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
     }
 }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
-
-    if (targetJavaVersion >= 10 || JavaVersion.current().isJava10Compatible()) {
-        options.release.set(targetJavaVersion)
-    }
 }
 
 processResources {
@@ -52,9 +44,6 @@ processResources {
     inputs.properties props
     filteringCharset = 'UTF-8'
     filesMatching('plugin.yml') {
-        expand props
-    }
-    filesMatching('config.yml') {
         expand props
     }
 }

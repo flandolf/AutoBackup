@@ -45,10 +45,8 @@ public final class AutoBackup extends JavaPlugin {
     private List<String> worlds;
     private Logger logger;
 
-    private boolean ftpEnabled;
     private FTPUploader ftpUploader;
 
-    private boolean dropboxEnabled;
     private DropboxUploader dropboxUploader;
 
     private ExecutorService backupExecutor;
@@ -117,8 +115,7 @@ public final class AutoBackup extends JavaPlugin {
         backupPath = Paths.get(getConfig().getString("backup-path", "backups"));
         worlds = List.copyOf(getConfig().getStringList("worlds"));
 
-        ftpEnabled = getConfig().getBoolean("ftp.enabled", false);
-        if (ftpEnabled) {
+        if (getConfig().getBoolean("ftp.enabled", false)) {
             ftpUploader = new FTPUploader(
                     getConfig().getString("ftp.host", ""),
                     getConfig().getInt("ftp.port", 990),
@@ -130,8 +127,7 @@ public final class AutoBackup extends JavaPlugin {
             );
         }
 
-        dropboxEnabled = getConfig().getBoolean("dropbox.enabled", false);
-        if (dropboxEnabled) {
+        if (getConfig().getBoolean("dropbox.enabled", false)) {
             dropboxUploader = new DropboxUploader(
                     getConfig().getString("dropbox.access-token", ""),
                     getConfig().getString("dropbox.remote-path", "/backups"),
@@ -148,11 +144,7 @@ public final class AutoBackup extends JavaPlugin {
         });
 
         long periodTicks = Math.multiplyExact((long) backupFrequency, 20L);
-        backupTriggerTask = getServer().getScheduler().runTaskTimer(this, () -> queueBackup(), 1L, periodTicks);
-    }
-
-    private void queueBackup() {
-        queueBackup(null);
+        backupTriggerTask = getServer().getScheduler().runTaskTimer(this, () -> queueBackup(null), 1L, periodTicks);
     }
 
     private boolean queueBackup(Consumer<Boolean> completion) {
@@ -253,12 +245,12 @@ public final class AutoBackup extends JavaPlugin {
         }
 
         checkCancellation();
-        if (ftpEnabled && ftpUploader != null) {
+        if (ftpUploader != null) {
             ftpUploader.uploadBackups(backupFiles);
         }
 
         checkCancellation();
-        if (dropboxEnabled && dropboxUploader != null) {
+        if (dropboxUploader != null) {
             dropboxUploader.uploadBackups(backupFiles);
         }
 
