@@ -24,6 +24,7 @@
 -   Selective backups of certain worlds
 
 -   Automatically delete old local world backups
+-   Run an immediate backup with `/backup` (operators only by default)
 -   Compress the data using the Deflate algorithm
 
 **Example file structure:**

@@ -2,3 +2,12 @@ name: AutoBackup
 version: '${version}'
 main: tr.alperendemir.autoBackup.AutoBackup
 api-version: '26.2'
+commands:
+  backup:
+    description: Creates a backup immediately
+    usage: /backup
+    permission: autobackup.backup
+permissions:
+  autobackup.backup:
+    description: Allows manual backups with /backup
+    default: op

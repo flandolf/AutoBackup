@@ -1,5 +1,7 @@
 package tr.alperendemir.autoBackup;
 
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -22,6 +24,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -80,6 +83,24 @@ public final class AutoBackup extends JavaPlugin {
         }
     }
 
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!command.getName().equalsIgnoreCase("backup")) {
+            return false;
+        }
+
+        if (args.length > 0) {
+            sender.sendMessage("Usage: /" + label);
+            return true;
+        }
+
+        boolean queued = queueBackup(completed -> sender.sendMessage(completed
+                ? "Backup completed."
+                : "Backup failed. Check the server log for details."));
+        sender.sendMessage(queued ? "Backup requested." : "A backup is already in progress.");
+        return true;
+    }
+
     private void loadConfigValues() {
         backupFrequency = getConfig().getInt("backup-frequency", 3600);
         if (backupFrequency <= 0) {
@@ -127,18 +148,30 @@ public final class AutoBackup extends JavaPlugin {
         });
 
         long periodTicks = Math.multiplyExact((long) backupFrequency, 20L);
-        backupTriggerTask = getServer().getScheduler().runTaskTimer(this, this::queueBackup, 1L, periodTicks);
+        backupTriggerTask = getServer().getScheduler().runTaskTimer(this, () -> queueBackup(), 1L, periodTicks);
     }
 
     private void queueBackup() {
+        queueBackup(null);
+    }
+
+    private boolean queueBackup(Consumer<Boolean> completion) {
         if (stopping.get() || !backupRunning.compareAndSet(false, true)) {
-            return;
+            return false;
+        }
+
+        ExecutorService executor = backupExecutor;
+        if (executor == null) {
+            backupRunning.set(false);
+            return false;
         }
 
         try {
-            backupExecutor.execute(() -> {
+            executor.execute(() -> {
+                boolean completed = false;
                 try {
                     performBackup();
+                    completed = true;
                 } catch (CancellationException ignored) {
                     // Expected when the plugin is disabled during a backup.
                 } catch (RuntimeException e) {
@@ -147,10 +180,16 @@ public final class AutoBackup extends JavaPlugin {
                     }
                 } finally {
                     backupRunning.set(false);
+                    if (completion != null && !stopping.get()) {
+                        boolean result = completed;
+                        getServer().getScheduler().runTask(this, () -> completion.accept(result));
+                    }
                 }
             });
+            return true;
         } catch (RejectedExecutionException ignored) {
             backupRunning.set(false);
+            return false;
         }
     }
 
